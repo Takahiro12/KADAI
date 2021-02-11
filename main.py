@@ -9,6 +9,7 @@ from tensorflow.keras.layers import Dense, Conv2D, BatchNormalization, GlobalAve
 from tensorflow.keras import metrics
 from tensorflow_addons import optimizers
 import sys
+import tensorflow_io as tfio
 
 
 class CNN(Model):
@@ -75,24 +76,24 @@ class ImageTransformations:
         self.epochs = 5000
         self.batch_size = 16
 
-    def BGRToCIELAB(self, img):
-        img_Lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)
-        img_L, img_a, img_b = cv2.split(img_Lab)
-        return img_L, img_a, img_b
+    def RGBToCIELAB(self, img):
+        lab = tfio.experimental.color.rgb_to_lab(img)
+        return lab
 
     def deltaE76(self, img1, img2):
-        L1, a1, b1 = self.BGRToCIELAB(img1)
-        L2, a2, b2 = self.BGRToCIELAB(img2)
+        lab1 = self.RGBToCIELAB(img1)
+        lab2 = self.RGBToCIELAB(img2)
 
-        loss = 0
+        loss = tf.convert_to_tensor(0., dtype=tf.float32)
         for i in range(img1.shape[0]):
             for j in range(img2.shape[1]):
-                loss += np.sqrt((int(L1[i][j])-int(L2[i][j]))**2 +
-                                (int(a1[i][j])-int(a2[i][j]))**2+(int(b1[i][j])-int(b2[i][j]))**2)
+                loss += tf.math.sqrt((lab1[i][j][0]-lab2[i][j][0])**2 +
+                                     (lab1[i][j][1]-lab2[i][j][1])**2+(lab1[i][j][2]-lab2[i][j][2])**2)
 
         return loss
 
     def deltaE94(self, img1, img2):
+        # 要修正
         L1, a1, b1 = self.BGRToCIELAB(img1)
         L2, a2, b2 = self.BGRToCIELAB(img2)
 
@@ -111,13 +112,14 @@ class ImageTransformations:
 
     def channelwise(self, theta, x):
         theta = tf.reshape(theta, (self.dim, 3))
+
         for i in range(x.shape[0]):
             for j in range(x.shape[1]):
-                term = np.zeros([self.dim, 3])
-                for k in range(self.dim):
-                    term[k] = theta[k] * self.function(k, x[i][j])
-                x[i][j] = x[i][j] + np.sum(term, axis=0)
-        return x  # pixel 単位での処理
+                # term = tf.Variable(tf.zeros([self.dim, 3]), dtype=tf.float32)
+                term = theta * np.array([self.function(k, x[i][j])
+                                         for k in range(self.dim)])
+                x = x[i, j].assign(tf.math.reduce_sum(term, axis=0))
+        return tf.Variable(x)  # pixel 単位での処理
 
     def fullcolor(self, theta, x):
         # 各pixel毎に修正
@@ -153,19 +155,18 @@ class ImageTransformations:
     def train_step(self, imgs_1_256, imgs_1, imgs_2):
         with tf.GradientTape() as tape:
             theta = self.model(imgs_1_256)
-            loss = 0
+            loss = tf.Variable(0, dtype=tf.float32)
             for i, _ in enumerate(imgs_1):
                 preds = self.transformer(theta[i], imgs_1[i])
                 loss += self.compute_loss(preds, imgs_2[i])
             loss = loss / len(imgs_1)
         grads = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(
-            zip(grads, self.model_trainable_variables))
+            zip(grads, self.model.trainable_variables))
         return loss
 
     def fit(self, train_files):
         n_batches = train_files.shape[0] // self.batch_size
-        print(n_batches)
 
         for epoch in range(self.epochs):
             for batch in range(n_batches):
@@ -178,17 +179,19 @@ class ImageTransformations:
                 imgs_1_256 = []
                 for file1, file2 in batch_files:
                     img1 = cv2.imread(file1)
-                    img2 = cv2.imread(file2)
+                    img1 = tf.Variable(img1, dtype=tf.float32)
+                    img2 = tf.io.read_file(file2)
+                    img2 = tf.image.decode_jpeg(img2, channels=3)
+                    img2 = tf.image.convert_image_dtype(img2, dtype=tf.float32)
                     imgs_1.append(img1)
                     imgs_2.append(img2)
-                    tmp = cv2.resize(img1.copy(), (256, 256))/255
+                    tmp = tf.image.resize(tf.identity(img1), (256, 256))/255
                     imgs_1_256.append(tmp)
 
-                imgs_1_256 = np.array(imgs_1_256)
-                loss = self.train_step(imgs_1_256, imgs_1, imgs_2)
+                loss = self.train_step(tf.Variable(imgs_1_256), imgs_1, imgs_2)
                 print(loss)
 
-            print(f'epoch: {epoch}, loss:{loss}')
+            print(f'epoch: {epoch}, loss: {loss}')
 
 
 def main():
